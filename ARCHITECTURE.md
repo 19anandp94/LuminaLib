@@ -1,6 +1,7 @@
 # LuminaLib Architecture Documentation
 
 ## Table of Contents
+
 1. [System Overview](#system-overview)
 2. [Database Schema Design](#database-schema-design)
 3. [Async Processing Strategy](#async-processing-strategy)
@@ -10,90 +11,125 @@
 
 ## System Overview
 
-LuminaLib follows Clean Architecture principles with clear separation of concerns:
+LuminaLib follows a **flat, modular architecture** with clear separation of concerns through routers, models, and pluggable providers:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Presentation Layer                    │
-│              (FastAPI Routes / Next.js Pages)            │
+│                    Frontend (Next.js)                    │
+│                      Port 3000                           │
+└─────────────────────────────────────────────────────────┘
+                            │ HTTP/REST
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│                  Backend (FastAPI)                       │
+│                      Port 8000                           │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │  Routers (auth, books, recommendations)         │   │
+│  └─────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │  Models & Schemas (SQLAlchemy + Pydantic)       │   │
+│  └─────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │  Pluggable Providers (LLM, Storage)             │   │
+│  └─────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────┘
                             │
-┌─────────────────────────────────────────────────────────┐
-│                     Service Layer                        │
-│        (Business Logic / Use Cases / Orchestration)      │
-└─────────────────────────────────────────────────────────┘
-                            │
-┌─────────────────────────────────────────────────────────┐
-│                  Infrastructure Layer                    │
-│     (Database / Storage / LLM / External Services)       │
-└─────────────────────────────────────────────────────────┘
+        ┌───────────────────┼───────────────────┐
+        ▼                   ▼                   ▼
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  PostgreSQL  │    │    Redis     │    │   Ollama     │
+│  Port 5432   │    │  Port 6379   │    │  Port 11434  │
+└──────────────┘    └──────────────┘    └──────────────┘
 ```
 
 ### Key Architectural Decisions
 
-1. **Dependency Injection**: All external dependencies (storage, LLM) are injected via factory functions
-2. **Interface-Driven Development**: Abstract base classes define contracts for swappable implementations
-3. **Async-First**: All I/O operations use async/await for maximum concurrency
-4. **Type Safety**: Pydantic schemas for backend, TypeScript for frontend
+1. **Flat Structure**: Simple, pragmatic file organization without nested layers
+2. **Modular Routers**: API endpoints organized by domain (auth, books, recommendations)
+3. **Strategy Pattern**: Pluggable LLM and storage providers via abstract base classes
+4. **Dependency Injection**: FastAPI's DI system for database sessions and current user
+5. **Async-First**: All I/O operations use async/await for maximum concurrency
+6. **Type Safety**: Pydantic schemas for backend validation, TypeScript for frontend
 
 ## Database Schema Design
 
-### User Preferences Schema
+### Actual Implementation
 
-The `user_preferences` table is central to our ML recommendation system:
+The application uses a **simple, normalized schema** with the following models (defined in `backend/app/models.py`):
 
-```sql
-CREATE TABLE user_preferences (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER UNIQUE REFERENCES users(id),
-    
-    -- Content-based features
-    favorite_genres TEXT[],           -- Top genres user reads
-    favorite_authors TEXT[],          -- Preferred authors
-    avg_rating_given FLOAT,           -- User's rating tendency
-    
-    -- Behavioral metrics
-    books_borrowed_count INTEGER,
-    books_reviewed_count INTEGER,
-    
-    -- Advanced ML features
-    genre_weights JSONB,              -- Genre preference weights
-    feature_vector FLOAT[],           -- Latent feature space representation
-    
-    last_updated TIMESTAMP
-);
+#### Core Models
+
+**User**: Authentication and user management
+
+- `id`, `email` (unique), `hashed_password`, `created_at`
+- Relationships: reviews, borrows, preferences, books_added
+
+**UserPreference**: Simple genre tracking for recommendations
+
+- `id`, `user_id`, `genre`, `created_at`
+- Design: One row per genre preference (e.g., user likes "Fiction", "Mystery")
+
+**Book**: Book metadata and file storage
+
+- `id`, `title`, `author`, `genre`, `summary` (AI-generated), `file_path`, `file_name`, `added_by_user_id`, `created_at`
+- Indexed on: title, author, genre (for search/filter performance)
+- Relationships: reviews, borrows, book_summary
+
+**BookSummary**: AI-generated book summaries
+
+- `id`, `book_id` (unique), `summary`, `created_at`
+- Separate table to keep Book model clean
+
+**Borrow**: Library borrowing records
+
+- `id`, `user_id`, `book_id`, `borrowed_at`, `returned_at` (nullable)
+- Business rule: `returned_at` is NULL while book is borrowed
+- Enables constraint: users must borrow before reviewing
+
+**Review**: User book reviews
+
+- `id`, `user_id`, `book_id`, `rating` (1-5), `text`, `created_at`
+- Triggers background sentiment analysis on creation
+
+**ReviewAnalysis**: AI sentiment analysis of reviews
+
+- `id`, `review_id` (unique), `sentiment`, `confidence`, `created_at`
+- Populated by LLM in background task
+
+### Database Relationships
+
+```
+User ──┬─> Reviews (one-to-many)
+       ├─> Borrows (one-to-many)
+       ├─> UserPreferences (one-to-many)
+       └─> Books (one-to-many, as uploader)
+
+Book ──┬─> Reviews (one-to-many)
+       ├─> Borrows (one-to-many)
+       └─> BookSummary (one-to-one)
+
+Review ──> ReviewAnalysis (one-to-one)
 ```
 
-**Design Rationale:**
+### Indexing Strategy
 
-1. **favorite_genres/authors**: Enable content-based filtering by matching user preferences with book attributes
-2. **avg_rating_given**: Identifies harsh vs. lenient reviewers for better collaborative filtering
-3. **genre_weights (JSONB)**: Flexible structure for storing weighted genre preferences
-   - Example: `{"fiction": 0.6, "sci-fi": 0.3, "mystery": 0.1}`
-   - Allows for nuanced preference modeling beyond simple lists
-4. **feature_vector**: Supports matrix factorization for collaborative filtering
-   - Represents user in latent feature space
-   - Can be computed using techniques like SVD or neural embeddings
-5. **Behavioral counts**: Track engagement level for recommendation confidence
+- **users.email**: Unique index for fast login lookups
+- **books.title, author, genre**: Indexes for search and filter queries
+- **borrows.user_id, book_id**: For borrowing history queries
 
-### Other Key Tables
+### Design Philosophy
 
-**Books Table**:
-- Stores both metadata AND file information
-- `ai_summary` and `review_consensus` fields for GenAI-generated content
-- `available_copies` for real-time availability tracking
+The schema is **intentionally simple** and **normalized**:
 
-**Borrow Records**:
-- Tracks borrowing history with `borrowed_at`, `due_date`, `returned_at`
-- Enables constraint: "users can only review borrowed books"
-
-**Reviews**:
-- Stores user reviews with AI-generated `sentiment_score` and `sentiment_label`
-- Triggers async consensus generation on creation
+- No complex JSONB fields or feature vectors (YAGNI principle)
+- Clear foreign key relationships
+- Separate tables for AI-generated content (summaries, sentiment)
+- Easy to understand and maintain
 
 ## Async Processing Strategy
 
 ### Challenge
+
 LLM operations (summarization, sentiment analysis) can take 10-60 seconds. We cannot block HTTP requests.
 
 ### Solution: Background Task Pattern
@@ -104,10 +140,10 @@ LLM operations (summarization, sentiment analysis) can take 10-60 seconds. We ca
 async def create_book(...):
     # 1. Upload file and create book record (fast)
     book = create_book_in_db(...)
-    
+
     # 2. Schedule async summarization (non-blocking)
     schedule_book_summarization(book.id)
-    
+
     # 3. Return immediately
     return book
 ```
@@ -115,6 +151,7 @@ async def create_book(...):
 ### Implementation
 
 **Current (Development)**:
+
 ```python
 def schedule_book_summarization(book_id: int):
     asyncio.create_task(process_book_summarization(book_id))
@@ -178,16 +215,16 @@ class RecommendationEngine:
     async def get_recommendations(self, user_id: int, limit: int = 10):
         # 1. Get user preferences
         preferences = await get_user_preferences(user_id)
-        
+
         # 2. Content-based: Books in favorite genres
         content_recs = await get_books_by_genres(
             preferences.favorite_genres
         )
-        
+
         # 3. Collaborative: Similar users' books
         similar_users = await find_similar_users(user_id)
         collab_recs = await get_books_from_users(similar_users)
-        
+
         # 4. Merge and rank
         return merge_recommendations([content_recs, collab_recs])
 ```
@@ -200,17 +237,17 @@ Preferences are updated after each interaction:
 async def update_user_preferences(user_id: int):
     # Analyze borrowing history
     borrowed_books = await get_borrowed_books(user_id)
-    
+
     # Extract patterns
     genres = Counter([b.genre for b in borrowed_books])
     authors = Counter([b.author for b in borrowed_books])
-    
+
     # Calculate weights
     genre_weights = {
-        genre: count / total 
+        genre: count / total
         for genre, count in genres.items()
     }
-    
+
     # Update preferences
     await save_preferences(user_id, {
         'favorite_genres': top_genres,
@@ -274,6 +311,7 @@ async def update_user_preferences(user_id: int):
 5. **Less Boilerplate**: No actions/reducers needed
 
 Example:
+
 ```typescript
 // Instead of Redux actions/reducers
 const { data, isLoading } = useBooks({ page: 1 });
@@ -291,19 +329,22 @@ Components never call APIs directly:
 ```typescript
 // ❌ Bad: Direct API call in component
 const BookList = () => {
-    const [books, setBooks] = useState([]);
-    useEffect(() => {
-        fetch('/api/books').then(r => r.json()).then(setBooks);
-    }, []);
+  const [books, setBooks] = useState([]);
+  useEffect(() => {
+    fetch("/api/books")
+      .then((r) => r.json())
+      .then(setBooks);
+  }, []);
 };
 
 // ✅ Good: Abstracted through hooks and services
 const BookList = () => {
-    const { data: books } = useBooks();
+  const { data: books } = useBooks();
 };
 ```
 
 Benefits:
+
 - Easy to mock for testing
 - Centralized error handling
 - Type safety across the stack
@@ -312,11 +353,13 @@ Benefits:
 ### SSR Strategy
 
 Next.js App Router enables:
+
 1. **Server Components**: Initial page load is server-rendered
 2. **Client Components**: Interactive parts use 'use client'
 3. **Streaming**: Progressive page rendering
 
 Example:
+
 ```typescript
 // Server Component (default)
 export default async function BooksPage() {
@@ -348,6 +391,7 @@ export function BookList({ books }) {
    - New LLM? Implement `LLMProvider` interface
 
 3. **Liskov Substitution**: Implementations are interchangeable
+
    ```python
    storage: StorageProvider = get_storage_provider()
    # Could be Local, MinIO, or S3 - code doesn't care
@@ -358,11 +402,12 @@ export function BookList({ books }) {
    - Not bloated with unrelated methods
 
 5. **Dependency Inversion**: Depend on abstractions
+
    ```python
    # High-level module depends on abstraction
    def upload_book(storage: StorageProvider, file):
        storage.upload_file(file)
-   
+
    # Not on concrete implementation
    def upload_book(local_storage: LocalStorage, file):  # ❌
    ```
@@ -379,28 +424,117 @@ def get_storage_provider() -> StorageProvider:
         return S3StorageProvider(...)
 ```
 
-### Repository Pattern
+### Direct Database Queries (Pragmatic Approach)
 
-Database access is abstracted:
+**Note**: The current implementation uses **direct SQLAlchemy queries** in routers for simplicity:
 
 ```python
-# Instead of direct SQLAlchemy queries everywhere
-class BookRepository:
-    async def get_by_id(self, id: int) -> Book:
-        ...
-    
-    async def list(self, filters: dict) -> List[Book]:
-        ...
+# Current approach (direct queries in routers)
+@router.get("/books")
+async def list_books(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Book))
+    return result.scalars().all()
 ```
+
+This is pragmatic for small applications. For larger codebases, consider the Repository pattern for better testability and abstraction.
+
+## Backend Implementation Details
+
+### File Structure (Flat Architecture)
+
+```
+backend/app/
+├── main.py              # FastAPI app initialization, CORS, routers
+├── config.py            # Pydantic Settings for environment variables
+├── db.py                # Database engine and session management
+├── models.py            # All SQLAlchemy models in one file
+├── schemas.py           # All Pydantic schemas in one file
+├── auth.py              # JWT token creation and verification
+├── deps.py              # FastAPI dependencies (get_db, get_current_user)
+├── recommendation_ml.py # ML recommendation engine
+├── routers/
+│   ├── auth.py          # POST /auth/signup, /auth/login, GET /auth/me
+│   ├── books.py         # CRUD + borrow/return + reviews
+│   └── recommendations.py  # ML recommendations + AI suggestions
+├── llm/
+│   ├── base.py          # Abstract LLMBackend class
+│   ├── ollama.py        # Ollama implementation
+│   ├── openai.py        # OpenAI implementation
+│   ├── mock.py          # Mock for testing
+│   └── prompts.py       # Prompt templates
+└── storage/
+    ├── base.py          # Abstract StorageBackend class
+    ├── local.py         # Local filesystem storage
+    └── s3.py            # AWS S3 storage
+```
+
+### Search Implementation
+
+The search functionality demonstrates efficient PostgreSQL querying with filters:
+
+```python
+@router.get("", response_model=BookListResponse)
+async def list_books(
+    search: str = None,      # Search by title or author
+    genre: str = None,       # Filter by genre
+    author: str = None,      # Filter by author
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(Book)
+
+    # Case-insensitive search using PostgreSQL's ilike
+    if search:
+        search_pattern = f"%{search}%"
+        query = query.where(
+            (Book.title.ilike(search_pattern)) |
+            (Book.author.ilike(search_pattern))
+        )
+
+    # Get total count with filters applied
+    count_query = select(func.count()).select_from(query.subquery())
+    total = (await db.execute(count_query)).scalar() or 0
+
+    # Get paginated results
+    items = (await db.execute(query.offset(skip).limit(limit))).scalars().all()
+
+    return BookListResponse(items=items, total=total)
+```
+
+**Key Features**: Case-insensitive search, multi-field search, proper pagination with filtered counts.
+
+### Authentication Flow
+
+```
+Signup → Hash password → Create user → Generate JWT → Return token (auto-login)
+Login → Verify password → Generate JWT → Return token
+Protected Routes → Validate JWT → Inject user → Execute logic
+```
+
+### LLM Integration (Strategy Pattern)
+
+```python
+def get_llm_backend() -> LLMBackend:
+    if settings.llm_provider == "ollama":
+        return OllamaBackend(...)
+    elif settings.llm_provider == "openai":
+        return OpenAIBackend(...)
+    else:
+        return MockLLMBackend()
+```
+
+Swap providers via environment variable. Easy to add new providers.
 
 ## Conclusion
 
 This architecture prioritizes:
-- **Maintainability**: Clear structure, easy to navigate
+
+- **Simplicity**: Flat structure, easy to navigate
+- **Pragmatism**: Direct queries instead of over-engineering
+- **Maintainability**: Clear separation via routers
 - **Testability**: Dependency injection enables mocking
 - **Scalability**: Async operations, background tasks
-- **Extensibility**: Swap implementations via config
+- **Extensibility**: Swap LLM/storage via config
 - **Type Safety**: Pydantic + TypeScript catch errors early
+- **Performance**: Async/await, proper indexing, efficient queries
 
-The system is production-ready and follows industry best practices for modern full-stack applications.
-
+The system follows **modern Python best practices** while avoiding unnecessary complexity. Production-ready for small to medium-scale deployments.

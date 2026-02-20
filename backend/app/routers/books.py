@@ -167,15 +167,41 @@ async def create_book(
 async def list_books(
     skip: int = 0,
     limit: int = DEFAULT_PAGE_LIMIT,
+    search: str = None,
+    genre: str = None,
+    author: str = None,
     db: AsyncSession = Depends(get_db),
 ):
     limit = min(max(MIN_PAGE_LIMIT, limit), MAX_PAGE_LIMIT)
-    total_result = await db.execute(select(func.count(Book.id)))
+
+    # Build query with filters
+    query = select(Book)
+
+    # Apply search filter (search in title and author)
+    if search:
+        search_pattern = f"%{search}%"
+        query = query.where(
+            (Book.title.ilike(search_pattern)) | (Book.author.ilike(search_pattern))
+        )
+
+    # Apply genre filter
+    if genre:
+        query = query.where(Book.genre.ilike(f"%{genre}%"))
+
+    # Apply author filter
+    if author:
+        query = query.where(Book.author.ilike(f"%{author}%"))
+
+    # Get total count with filters
+    count_query = select(func.count()).select_from(query.subquery())
+    total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
-    books_result = await db.execute(
-        select(Book).offset(skip).limit(limit).order_by(Book.created_at.desc())
-    )
+
+    # Get paginated results
+    query = query.offset(skip).limit(limit).order_by(Book.created_at.desc())
+    books_result = await db.execute(query)
     items = books_result.scalars().all()
+
     return BookListResponse(items=items, total=total, skip=skip, limit=limit)
 
 
