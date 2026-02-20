@@ -462,10 +462,6 @@ docker-compose restart backend
 - **Input Validation**: Pydantic schemas validate all inputs
 - **File Upload Validation**: File type and size validation
 
-## License
-
-MIT License
-
 ## Support
 
 For issues and questions, please open an issue on GitHub.
