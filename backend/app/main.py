@@ -1,69 +1,46 @@
-"""
-LuminaLib - Intelligent Library System
-Main FastAPI application entry point.
-"""
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import auth, books, recommendations, reviews
-from app.core.config import settings
-from app.core.database import Base, engine
+from app.routers import auth, books, recommendations
 
+app = FastAPI(title="LuminaLib API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Application lifespan manager.
-    Handles startup and shutdown events.
-    """
-    # Startup: Create database tables
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    
-    yield
-    
-    # Shutdown: Clean up resources
-    await engine.dispose()
-
-
-# Create FastAPI application
-app = FastAPI(
-    title="LuminaLib API",
-    description="Intelligent Library System with GenAI and ML-powered features",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Include routers
 app.include_router(auth.router)
 app.include_router(books.router)
-app.include_router(reviews.router)
 app.include_router(recommendations.router)
 
 
-@app.get("/")
-async def root():
-    """Root endpoint."""
-    return {
-        "message": "Welcome to LuminaLib API",
-        "version": "1.0.0",
-        "docs": "/docs",
-    }
-
-
 @app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy"}
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/health/ollama")
+async def health_ollama():
+    """Verify Ollama is reachable and configured model is available."""
+    from app.config import settings
+    if settings.llm_provider != "ollama":
+        return {"ollama": "not_used", "llm_provider": settings.llm_provider}
+    import httpx
+    base = settings.ollama_base_url.rstrip("/")
+    model = getattr(settings, "ollama_model", "llama3.2") or "llama3.2"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{base}/api/tags")
+            r.raise_for_status()
+            data = r.json()
+        models = data.get("models") or []
+        names = [m.get("name", "") for m in models]
+        # Model can be "llama3.2" or "llama3.2:latest"
+        model_loaded = any(name == model or name.startswith(model + ":") for name in names)
+        return {
+            "ollama": "ok",
+            "url": base,
+            "model": model,
+            "model_loaded": model_loaded,
+            "hint": "Run: ollama pull " + model if not model_loaded else None,
+        }
+    except Exception as e:
+        return {"ollama": "unavailable", "url": base, "model": model, "detail": str(e)}
 

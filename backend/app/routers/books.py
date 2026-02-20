@@ -1,0 +1,376 @@
+import uuid
+from datetime import datetime
+from io import BytesIO
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import FileResponse, Response
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db import get_db
+from app.models import User, Book, Borrow, Review, BookSummary, ReviewAnalysis
+from app.schemas import (
+    BookCreate,
+    BookDetailResponse,
+    BookListResponse,
+    BookResponse,
+    BookUpdate,
+    MyReviewResponse,
+    ReviewCreate,
+    ReviewResponse,
+)
+from app.deps import get_current_user, get_optional_user, get_storage, get_llm
+
+router = APIRouter(prefix="/books", tags=["books"])
+
+# Constants for text extraction
+MIN_CONTENT_LENGTH = 50
+MAX_PDF_PAGES = 50
+MAX_PDF_TEXT_LENGTH = 12000
+MAX_TEXT_LENGTH = 8000
+MIN_EXTRACTED_TEXT_LENGTH = 100
+
+# Constants for pagination
+DEFAULT_PAGE_LIMIT = 20
+MIN_PAGE_LIMIT = 1
+MAX_PAGE_LIMIT = 100
+
+# Constants for ratings
+MIN_RATING = 1
+MAX_RATING = 5
+
+
+def _extract_text_for_summary(content: bytes, filename: str | None) -> str | None:
+    """Extract plain text from file content for LLM summarization. Returns None if not usable."""
+    if not content or len(content) < MIN_CONTENT_LENGTH:
+        return None
+    ext = (filename or "").split(".")[-1].lower() if "." in (filename or "") else ""
+    if ext == "pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(BytesIO(content))
+            parts = []
+            for page in reader.pages[:MAX_PDF_PAGES]:
+                t = page.extract_text()
+                if t:
+                    parts.append(t)
+            text = "\n".join(parts).strip()[:MAX_PDF_TEXT_LENGTH]
+            if not text or text.startswith("%PDF") or len(text) < MIN_EXTRACTED_TEXT_LENGTH:
+                return None
+            return text
+        except Exception:  # PDF parsing can fail for various reasons
+            return None
+    try:
+        text = content.decode("utf-8", errors="ignore").strip()[:MAX_TEXT_LENGTH]
+        if not text or text.startswith("%PDF"):
+            return None
+        return text
+    except Exception:  # Text decoding can fail for binary content
+        return None
+
+
+def _run_summary_task(book_id: int, text: str):
+    import asyncio
+    import threading
+    from app.db import SessionLocal
+    from app.deps import get_llm
+
+    async def _run():
+        llm = get_llm()
+        summary_text = await llm.summarize(text)
+        async with SessionLocal() as db:
+            from app.models import BookSummary, Book
+            summary_result = await db.execute(select(BookSummary).where(BookSummary.book_id == book_id))
+            summary_row = summary_result.scalar_one_or_none()
+            if summary_row:
+                summary_row.content = summary_text
+            else:
+                summary_row = BookSummary(book_id=book_id, content=summary_text)
+                db.add(summary_row)
+            book_result = await db.execute(select(Book).where(Book.id == book_id))
+            book = book_result.scalar_one()
+            book.summary = summary_text
+            await db.commit()
+
+    def run():
+        asyncio.run(_run())
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _run_sentiment_task(book_id: int, review_texts: list[str]):
+    import asyncio
+    import threading
+    from app.db import SessionLocal
+    from app.deps import get_llm
+
+    async def _run():
+        llm = get_llm()
+        consensus = await llm.analyze_sentiment(review_texts)
+        async with SessionLocal() as db:
+            from app.models import ReviewAnalysis
+            analysis_result = await db.execute(select(ReviewAnalysis).where(ReviewAnalysis.book_id == book_id))
+            analysis_row = analysis_result.scalar_one_or_none()
+            if analysis_row:
+                analysis_row.consensus = consensus
+            else:
+                analysis_row = ReviewAnalysis(book_id=book_id, consensus=consensus)
+                db.add(analysis_row)
+            await db.commit()
+
+    def run():
+        asyncio.run(_run())
+    threading.Thread(target=run, daemon=True).start()
+
+
+@router.post("", response_model=BookResponse)
+async def create_book(
+    background_tasks: BackgroundTasks,
+    title: str = Form(...),
+    author: str = Form(None),
+    genre: str = Form(None),
+    file: UploadFile = File(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    storage=Depends(get_storage),
+):
+    file_path = None
+    file_name = None
+    content = b""
+    if file and file.filename:
+        ext = file.filename.split(".")[-1] if "." in file.filename else "bin"
+        key = f"books/{uuid.uuid4().hex}.{ext}"
+        content = await file.read()
+        await storage.put(key, BytesIO(content))
+        file_path = key
+        file_name = file.filename
+
+    book = Book(
+        title=title,
+        author=author or None,
+        genre=genre or None,
+        file_path=file_path,
+        file_name=file_name,
+        added_by_user_id=user.id,
+    )
+    db.add(book)
+    await db.commit()
+    await db.refresh(book)
+
+    if file_path and content:
+        text = _extract_text_for_summary(content, file_name)
+        if text:
+            background_tasks.add_task(_run_summary_task, book.id, text)
+
+    return book
+
+
+@router.get("", response_model=BookListResponse)
+async def list_books(
+    skip: int = 0,
+    limit: int = DEFAULT_PAGE_LIMIT,
+    db: AsyncSession = Depends(get_db),
+):
+    limit = min(max(MIN_PAGE_LIMIT, limit), MAX_PAGE_LIMIT)
+    total_result = await db.execute(select(func.count(Book.id)))
+    total = total_result.scalar() or 0
+    books_result = await db.execute(
+        select(Book).offset(skip).limit(limit).order_by(Book.created_at.desc())
+    )
+    items = books_result.scalars().all()
+    return BookListResponse(items=items, total=total, skip=skip, limit=limit)
+
+
+@router.get("/{book_id}", response_model=BookDetailResponse)
+async def get_book(
+    book_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User | None = Depends(get_optional_user),
+):
+    book_result = await db.execute(select(Book).where(Book.id == book_id))
+    book = book_result.scalar_one_or_none()
+    if not book:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
+    currently_borrowed_by_me = False
+    can_review = False
+    my_review = None
+    if user:
+        borrow_result = await db.execute(
+            select(Borrow).where(
+                Borrow.book_id == book_id,
+                Borrow.user_id == user.id,
+                Borrow.returned_at.is_(None),
+            )
+        )
+        currently_borrowed_by_me = borrow_result.scalar_one_or_none() is not None
+        can_review = currently_borrowed_by_me  # true only when currently borrowed (no returned_at)
+        review_result = await db.execute(
+            select(Review).where(Review.book_id == book_id, Review.user_id == user.id).limit(1)
+        )
+        review_row = review_result.scalars().first()
+        if review_row:
+            my_review = MyReviewResponse(rating=review_row.rating, text=review_row.text)
+    return BookDetailResponse(
+        id=book.id,
+        title=book.title,
+        author=book.author,
+        genre=book.genre,
+        summary=book.summary,
+        created_at=book.created_at,
+        currently_borrowed_by_me=currently_borrowed_by_me,
+        can_review=can_review,
+        file_name=book.file_name,
+        my_review=my_review,
+    )
+
+
+@router.get("/{book_id}/file")
+async def get_book_file(
+    book_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    storage=Depends(get_storage),
+):
+    """Return the uploaded book file (text or PDF) for viewing. Requires auth."""
+    book_result = await db.execute(select(Book).where(Book.id == book_id))
+    book = book_result.scalar_one_or_none()
+    if not book or not book.file_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book or file not found")
+    content = await storage.get(book.file_path)
+    if not content:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    file_name = book.file_name or "file"
+    ext = file_name.split(".")[-1].lower() if "." in file_name else ""
+    media_type = "application/pdf" if ext == "pdf" else "text/plain"
+    return Response(content=content, media_type=media_type, headers={"Content-Disposition": f'inline; filename="{file_name}"'})
+
+
+@router.put("/{book_id}", response_model=BookResponse)
+async def update_book(
+    book_id: int,
+    data: BookUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    book_result = await db.execute(select(Book).where(Book.id == book_id))
+    book = book_result.scalar_one_or_none()
+    if not book:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
+    if data.title is not None:
+        book.title = data.title
+    if data.author is not None:
+        book.author = data.author
+    if data.genre is not None:
+        book.genre = data.genre
+    await db.commit()
+    await db.refresh(book)
+    return book
+
+
+@router.delete("/{book_id}")
+async def delete_book(
+    book_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    storage=Depends(get_storage),
+):
+    book_result = await db.execute(select(Book).where(Book.id == book_id))
+    book = book_result.scalar_one_or_none()
+    if not book:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
+    if book.file_path:
+        await storage.delete(book.file_path)
+    await db.delete(book)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/{book_id}/borrow")
+async def borrow_book(
+    book_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    book_result = await db.execute(select(Book).where(Book.id == book_id))
+    book = book_result.scalar_one_or_none()
+    if not book:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
+    existing_borrow_result = await db.execute(
+        select(Borrow).where(Borrow.book_id == book_id, Borrow.user_id == user.id, Borrow.returned_at.is_(None))
+    )
+    if existing_borrow_result.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Already borrowed")
+    borrow = Borrow(user_id=user.id, book_id=book_id)
+    db.add(borrow)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/{book_id}/return")
+async def return_book(
+    book_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    borrow_result = await db.execute(
+        select(Borrow).where(Borrow.book_id == book_id, Borrow.user_id == user.id, Borrow.returned_at.is_(None))
+    )
+    borrow = borrow_result.scalar_one_or_none()
+    if not borrow:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No active borrow for this book")
+    borrow.returned_at = datetime.utcnow()
+    await db.commit()
+    return {"ok": True}
+
+
+@router.get("/{book_id}/reviews", response_model=list[ReviewResponse])
+async def get_reviews(
+    book_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get all reviews for a book."""
+    reviews_result = await db.execute(
+        select(Review).where(Review.book_id == book_id).order_by(Review.created_at.desc())
+    )
+    reviews = reviews_result.scalars().all()
+    return reviews
+
+
+@router.post("/{book_id}/reviews", response_model=ReviewResponse)
+async def create_review(
+    book_id: int,
+    data: ReviewCreate,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    borrow_result = await db.execute(
+        select(Borrow).where(Borrow.book_id == book_id, Borrow.user_id == user.id)
+    )
+    borrowed = borrow_result.scalars().first()
+    if not borrowed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Must borrow book before reviewing")
+    if data.rating < MIN_RATING or data.rating > MAX_RATING:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Rating must be {MIN_RATING}-{MAX_RATING}")
+    review = Review(user_id=user.id, book_id=book_id, rating=data.rating, text=data.text)
+    db.add(review)
+    await db.commit()
+    await db.refresh(review)
+
+    reviews_result = await db.execute(select(Review).where(Review.book_id == book_id))
+    all_reviews = reviews_result.scalars().all()
+    texts = [r.text or f"Rating: {r.rating}" for r in all_reviews if r.text or r.rating]
+    if texts:
+        background_tasks.add_task(_run_sentiment_task, book_id, texts)
+
+    return review
+
+
+@router.get("/{book_id}/analysis")
+async def get_analysis(book_id: int, db: AsyncSession = Depends(get_db)):
+    book_result = await db.execute(select(Book).where(Book.id == book_id))
+    book = book_result.scalar_one_or_none()
+    if not book:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
+    analysis_result = await db.execute(select(ReviewAnalysis).where(ReviewAnalysis.book_id == book_id))
+    review_analysis = analysis_result.scalar_one_or_none()
+    return {"summary": book.summary, "consensus": review_analysis.consensus if review_analysis else None}
+
