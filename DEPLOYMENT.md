@@ -252,43 +252,91 @@ After populating sample data, test the complete functionality:
 5. **Sentiment Analysis**: Check the review analysis (runs in background)
 6. **Recommendations**: Visit /recommendations to see personalized suggestions
 
-## Development Mode
+## Development Workflow
 
-### Backend Development (Without Docker)
+All development is done using Docker to ensure consistency across environments.
+
+### Making Code Changes
+
+After making code changes, you have two options:
+
+**Option 1: Hot Reload (Faster)**
+
+Both backend and frontend support hot reload in development mode:
+
+- **Backend**: FastAPI with `--reload` flag automatically picks up changes
+- **Frontend**: Next.js dev server automatically reloads on file changes
+
+Simply edit your code and refresh the browser - no rebuild needed!
+
+**Option 2: Copy Files to Running Container (For specific files)**
 
 ```bash
-cd backend
+# Copy updated backend file
+docker cp backend/app/routers/books.py luminalib-backend:/app/app/routers/books.py
+docker-compose restart backend
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Set environment variables
-export DATABASE_URL="postgresql://lumina:lumina_password@localhost:5432/luminalib"
-export JWT_SECRET_KEY="your-secret-key"
-export STORAGE_PROVIDER="local"
-export LLM_PROVIDER="mock"
-
-# Run development server
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+# Copy updated frontend file
+docker cp frontend/src/app/page.tsx luminalib-frontend:/app/src/app/page.tsx
+# Frontend auto-reloads, no restart needed
 ```
 
-### Frontend Development (Without Docker)
+**Option 3: Full Rebuild (Slowest, for dependency changes)**
 
 ```bash
-cd frontend
+# Rebuild all services
+docker-compose up -d --build
 
-# Install dependencies
-npm install
+# Rebuild specific service
+docker-compose up -d --build backend
+```
 
-# Set environment variable
-export NEXT_PUBLIC_API_URL="http://localhost:8000"
+### Viewing Logs
 
-# Run development server
-npm run dev
+```bash
+# View all logs
+docker-compose logs -f
+
+# View specific service logs
+docker-compose logs -f backend
+docker-compose logs -f frontend
+docker-compose logs -f postgres
+```
+
+### Running Tests
+
+```bash
+# Backend tests
+docker-compose exec backend pytest
+
+# Frontend tests
+docker-compose exec frontend npm test
+
+# Run specific test file
+docker-compose exec backend pytest tests/test_auth.py
+```
+
+### Accessing Database
+
+```bash
+# Connect to PostgreSQL
+docker-compose exec postgres psql -U lumina -d luminalib
+
+# Run SQL queries
+docker-compose exec postgres psql -U lumina -d luminalib -c "SELECT * FROM users;"
+```
+
+### Accessing Services Directly
+
+```bash
+# Backend shell
+docker-compose exec backend bash
+
+# Frontend shell
+docker-compose exec frontend sh
+
+# Run Python commands in backend
+docker-compose exec backend python -c "from app.config import settings; print(settings.DATABASE_URL)"
 ```
 
 ## Testing the Application

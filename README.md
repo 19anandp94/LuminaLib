@@ -131,38 +131,41 @@ The database tables are created automatically on first run. You can start using 
 
 ## Development
 
-### Backend Development
+All development is done using Docker to ensure consistency across environments.
+
+### Viewing Logs
 
 ```bash
-cd backend
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
+# View all logs
+docker-compose logs -f
+
+# View specific service logs
+docker-compose logs -f backend
+docker-compose logs -f frontend
 ```
 
-### Frontend Development
+### Rebuilding After Code Changes
 
 ```bash
-cd frontend
-npm install
-npm run dev
+# Rebuild and restart all services
+docker-compose up -d --build
+
+# Rebuild specific service
+docker-compose up -d --build backend
 ```
 
 ### Running Tests
 
-Backend:
+Backend tests:
 
 ```bash
-cd backend
-pytest
+docker-compose exec backend pytest
 ```
 
-Frontend:
+Frontend tests:
 
 ```bash
-cd frontend
-npm test
+docker-compose exec frontend npm test
 ```
 
 ## Configuration
@@ -270,6 +273,71 @@ See full interactive API documentation at http://localhost:8000/docs (Swagger UI
 ### Health Check
 
 - `GET /health` - API health status
+
+## Architecture Highlights
+
+### Frontend Service Layer Pattern
+
+The frontend follows a **strict service layer architecture** - components never make direct API calls:
+
+```
+┌─────────────────────────────────────────┐
+│         Page Components                 │  ← UI logic only
+│         (app/books/page.tsx)            │
+└─────────────────────────────────────────┘
+                  ↓ uses
+┌─────────────────────────────────────────┐
+│         Custom Hooks                    │  ← Business logic
+│         (lib/hooks/useBooks.ts)         │
+└─────────────────────────────────────────┘
+                  ↓ calls
+┌─────────────────────────────────────────┐
+│         API Services                    │  ← API abstraction
+│         (lib/api/services.ts)           │
+└─────────────────────────────────────────┘
+                  ↓ uses
+┌─────────────────────────────────────────┐
+│         API Client                      │  ← HTTP client
+│         (lib/api/client.ts)             │
+└─────────────────────────────────────────┘
+```
+
+**Benefits**:
+
+- ✅ **No fetch() in components** - all API calls abstracted
+- ✅ **Type safety** - TypeScript types for all requests/responses
+- ✅ **Automatic caching** - React Query handles caching and invalidation
+- ✅ **Loading states** - Automatic loading/error state management
+- ✅ **Testability** - Easy to mock services in tests
+
+**Example**:
+
+```typescript
+// ❌ BAD: Direct API call in component
+const BooksPage = () => {
+  const [books, setBooks] = useState([]);
+  useEffect(() => {
+    fetch("/api/books")
+      .then((r) => r.json())
+      .then(setBooks);
+  }, []);
+};
+
+// ✅ GOOD: Using service layer
+const BooksPage = () => {
+  const { data: books, isLoading } = useBooks({ page: 1 });
+  // Component only handles UI logic
+};
+```
+
+### Docker-First Development
+
+All development is done using Docker to ensure consistency:
+
+- ✅ **No local dependencies** - everything runs in containers
+- ✅ **Hot reload** - both backend and frontend support live reloading
+- ✅ **Consistent environments** - same setup for dev, test, and production
+- ✅ **Easy onboarding** - `docker-compose up` and you're ready
 
 ## Project Structure
 
